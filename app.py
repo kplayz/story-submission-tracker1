@@ -1,9 +1,14 @@
+import hashlib
 import io
+import os
+import secrets
 import sqlite3
 from pathlib import Path
+from urllib.parse import urlencode
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -11,13 +16,232 @@ DB_PATH = BASE_DIR / "data" / "story_submissions.db"
 STATUS_ORDER = ["submitted", "accepted", "rejected", "withdrawn"]
 
 
+def get_secret_value(key, default=""):
+    """Read Streamlit Cloud secrets first, then local environment variables."""
+    try:
+        value = st.secrets.get(key, default)
+    except Exception:
+        value = default
+
+    if value in (None, ""):
+        value = os.getenv(key, default)
+
+    return str(value)
+
+
+GOOGLE_CLIENT_ID = get_secret_value("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = get_secret_value("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = get_secret_value("GOOGLE_REDIRECT_URI", "http://localhost:8501")
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def get_user_by_email(email):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id, name, email, password_hash FROM users WHERE LOWER(email) = LOWER(?)",
+        (email or "",),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "email": row[2], "password_hash": row[3]}
+
+
+def create_user(name, email, password):
+    clean_email = (email or "").strip().lower()
+    clean_name = (name or "").strip()
+    if not clean_name or not clean_email or not password:
+        return False, "Name, email and password are required."
+    if "@" not in clean_email:
+        return False, "Please enter a valid email address."
+    if get_user_by_email(clean_email):
+        return False, "An account with this email already exists."
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
+        (clean_name, clean_email, hash_password(password)),
+    )
+    conn.commit()
+    conn.close()
+    return True, "User created successfully."
+
+
+def authenticate_user(email, password):
+    user = get_user_by_email(email)
+    if not user:
+        return None
+    if user["password_hash"] != hash_password(password):
+        return None
+    return user
+
+
+def create_or_get_google_user(email, name):
+    clean_email = (email or "").strip().lower()
+    clean_name = (name or "").strip() or "Google User"
+    if not clean_email:
+        return None
+    existing = get_user_by_email(clean_email)
+    if existing:
+        return existing
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
+        (clean_name, clean_email, hash_password(secrets.token_urlsafe(16))),
+    )
+    conn.commit()
+    conn.close()
+    return get_user_by_email(clean_email)
+
+
+def get_google_auth_url():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return None
+    state = secrets.token_urlsafe(16)
+    st.session_state["google_oauth_state"] = state
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "online",
+        "prompt": "select_account",
+        "state": state,
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def handle_google_callback():
+    code = st.query_params.get("code")
+    if not code:
+        return False
+
+    state = st.query_params.get("state")
+    if st.session_state.get("google_oauth_state") and state != st.session_state.get("google_oauth_state"):
+        st.error("Google login session is invalid. Please try again.")
+        return False
+
+    token_response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+    if token_response.status_code != 200:
+        st.error("Google authentication failed while exchanging the auth code.")
+        return False
+
+    token_data = token_response.json()
+    userinfo_response = requests.get(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        headers={"Authorization": f"Bearer {token_data.get('access_token', '')}"},
+        timeout=30,
+    )
+    if userinfo_response.status_code != 200:
+        st.error("Google authentication failed while fetching user profile.")
+        return False
+
+    user_info = userinfo_response.json()
+    user_email = (user_info.get("email") or "").lower()
+    user_name = user_info.get("name") or "Google User"
+    user = create_or_get_google_user(user_email, user_name)
+    if not user:
+        st.error("Unable to create or load your Google user profile.")
+        return False
+
+    st.session_state["user_email"] = user["email"]
+    st.session_state["user_name"] = user["name"]
+    st.session_state.pop("google_oauth_state", None)
+    st.query_params.clear()
+    return True
+
+
+def render_auth_page():
+    st.title("Story Submission Tracker")
+    st.caption("Create a writer account or sign in to view your story portfolio.")
+    st.markdown("---")
+
+    auth_url = get_google_auth_url()
+    if auth_url:
+        st.link_button("Continue with Google", auth_url, use_container_width=True)
+    else:
+        st.warning(
+            "Google OAuth is not configured. Add GOOGLE_CLIENT_ID and "
+            "GOOGLE_CLIENT_SECRET to .streamlit/secrets.toml, then restart Streamlit. "
+            "You can still create a local account below."
+        )
+
+    st.markdown("---")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        with st.form("login_form"):
+            st.subheader("Writer Login")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            login_clicked = st.form_submit_button("Login")
+            if login_clicked:
+                user = authenticate_user(email, password)
+                if user:
+                    st.session_state["user_email"] = user["email"]
+                    st.session_state["user_name"] = user["name"]
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+    with register_tab:
+        with st.form("register_form"):
+            st.subheader("Create a New Writer Account")
+            name = st.text_input("Full Name")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            register_clicked = st.form_submit_button("Create Account")
+            if register_clicked:
+                if not name or not email or not password:
+                    st.warning("Please complete all fields.")
+                elif password != confirm_password:
+                    st.warning("Passwords do not match.")
+                else:
+                    success, message = create_user(name, email, password)
+                    if success:
+                        st.success(message)
+                        st.session_state["user_email"] = email.strip().lower()
+                        st.session_state["user_name"] = name.strip()
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+    st.stop()
+
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_email TEXT NOT NULL DEFAULT '',
             story_name TEXT NOT NULL,
             submitted_to TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -27,6 +251,9 @@ def init_db():
         )
         """
     )
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(submissions)").fetchall()]
+    if "user_email" not in columns:
+        conn.execute("ALTER TABLE submissions ADD COLUMN user_email TEXT NOT NULL DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -80,26 +307,30 @@ def safe_date_value(value):
         return None
 
 
-def load_data():
+def load_data(user_email=None):
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        "SELECT id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story FROM submissions ORDER BY date_of_submission DESC, id DESC",
-        conn,
-    )
+    query = "SELECT id, user_email, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story FROM submissions"
+    params = []
+    if user_email is not None:
+        query += " WHERE user_email = ?"
+        params.append((user_email or "").lower())
+    query += " ORDER BY date_of_submission DESC, id DESC"
+    df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     if df.empty:
-        return pd.DataFrame(columns=["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
+        return pd.DataFrame(columns=["id", "user_email", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
     return df
 
 
-def insert_submission(story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story):
+def insert_submission(story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story, user_email=""):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
-        INSERT INTO submissions (story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO submissions (user_email, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            (user_email or "").lower(),
             clean_text(story_name),
             clean_text(submitted_to),
             normalize_status(status),
@@ -112,15 +343,16 @@ def insert_submission(story_name, submitted_to, status, date_of_submission, date
     conn.close()
 
 
-def update_submission(submission_id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story):
+def update_submission(submission_id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story, user_email=""):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         UPDATE submissions
-        SET story_name = ?, submitted_to = ?, status = ?, date_of_submission = ?, date_of_response = ?, url_for_story = ?
+        SET user_email = ?, story_name = ?, submitted_to = ?, status = ?, date_of_submission = ?, date_of_response = ?, url_for_story = ?
         WHERE id = ?
         """,
         (
+            (user_email or "").lower(),
             clean_text(story_name),
             clean_text(submitted_to),
             normalize_status(status),
@@ -211,15 +443,15 @@ def get_status_colors():
     }
 
 
-def get_existing_story_names():
-    data = load_data()
+def get_existing_story_names(user_email=None):
+    data = load_data(user_email)
     if data.empty:
         return []
     return sorted({str(value).strip() for value in data["story_name"].dropna() if str(value).strip()})
 
 
-def get_existing_entities():
-    data = load_data()
+def get_existing_entities(user_email=None):
+    data = load_data(user_email)
     if data.empty:
         return []
     return sorted({str(value).strip() for value in data["submitted_to"].dropna() if str(value).strip()})
@@ -254,10 +486,35 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 init_db()
 
+if "user_email" not in st.session_state:
+    st.session_state["user_email"] = None
+
+if "user_name" not in st.session_state:
+    st.session_state["user_name"] = "Writer"
+
+if not st.session_state.get("user_email"):
+    if handle_google_callback():
+        pass
+    if not st.session_state.get("user_email"):
+        render_auth_page()
+
+user_email = st.session_state.get("user_email")
+user_name = st.session_state.get("user_name")
+
 st.title("Story Submission Tracker")
-st.caption("Track submissions across journals, magazines, and publishers from a mobile-friendly dashboard.")
+st.caption(f"Portfolio for {user_name}.")
 
 with st.sidebar:
+    st.subheader("Writer")
+    st.write(user_name)
+    st.write(user_email)
+    if st.button("Logout"):
+        st.session_state.pop("user_email", None)
+        st.session_state.pop("user_name", None)
+        st.session_state.pop("google_oauth_state", None)
+        st.rerun()
+
+    st.markdown("---")
     st.header("Filters")
     search_term = st.text_input("Search by story name")
     status_filter = st.selectbox("Status filter", ["all", *STATUS_ORDER])
@@ -284,7 +541,7 @@ with st.sidebar:
             if st.button("Import file"):
                 if replace_existing:
                     conn = sqlite3.connect(DB_PATH)
-                    conn.execute("DELETE FROM submissions")
+                    conn.execute("DELETE FROM submissions WHERE user_email = ?", ((user_email or "").lower(),))
                     conn.commit()
                     conn.close()
 
@@ -296,6 +553,7 @@ with st.sidebar:
                         row["date_of_submission"],
                         row["date_of_response"],
                         row["url_for_story"],
+                        user_email=user_email,
                     )
                 st.success(f"Imported {len(imported_df)} rows.")
                 st.rerun()
@@ -304,7 +562,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Export data")
-    export_df = load_data()
+    export_df = load_data(user_email)
     if not export_df.empty:
         export_buffer = io.BytesIO()
         with pd.ExcelWriter(export_buffer, engine="openpyxl") as writer:
@@ -312,14 +570,14 @@ with st.sidebar:
         st.download_button(
             label="Download Excel",
             data=export_buffer.getvalue(),
-            file_name="story_submissions.xlsx",
+            file_name=f"{user_email.split('@')[0]}_story_submissions.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
         st.info("No data to export yet.")
 
 
-df = load_data()
+df = load_data(user_email)
 if not df.empty:
     df["status"] = df["status"].apply(normalize_status)
     if search_term:
@@ -372,8 +630,8 @@ st.markdown("---")
 
 with st.form("new_submission_form", clear_on_submit=True):
     st.subheader("Add a submission")
-    existing_story_names = get_existing_story_names()
-    existing_entities = get_existing_entities()
+    existing_story_names = get_existing_story_names(user_email)
+    existing_entities = get_existing_entities(user_email)
 
     story_new_option = "Type a new story name..."
     entity_new_option = "Type a new entity name..."
@@ -418,6 +676,7 @@ with st.form("new_submission_form", clear_on_submit=True):
                 date_of_submission.isoformat() if date_of_submission else None,
                 date_of_response.isoformat() if date_of_response else None,
                 url_for_story,
+                user_email=user_email,
             )
             st.session_state["reset_submission_form"] = True
             st.success("Submission saved. The form will refresh to a clean state.")
@@ -476,6 +735,7 @@ else:
                 date_of_submission_edit.isoformat() if date_of_submission_edit else None,
                 date_of_response_edit.isoformat() if date_of_response_edit else None,
                 url_for_story_edit,
+                user_email=user_email,
             )
             st.success("Record updated.")
             st.rerun()
