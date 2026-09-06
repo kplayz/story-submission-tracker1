@@ -1,0 +1,516 @@
+import io
+import sqlite3
+from pathlib import Path
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "data" / "story_submissions.db"
+STATUS_ORDER = ["submitted", "accepted", "rejected", "withdrawn"]
+
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_name TEXT NOT NULL,
+            submitted_to TEXT NOT NULL,
+            status TEXT NOT NULL,
+            date_of_submission TEXT,
+            date_of_response TEXT,
+            url_for_story TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def normalize_status(value):
+    if value is None or pd.isna(value):
+        return "submitted"
+    normalized = str(value).strip().lower()
+    if normalized == "":
+        return "submitted"
+    mappings = {
+        "accepted": "accepted",
+        "accept": "accepted",
+        "submitted": "submitted",
+        "pending": "submitted",
+        "rejected": "rejected",
+        "reject": "rejected",
+        "withdrawn": "withdrawn",
+        "withdraw": "withdrawn",
+    }
+    return mappings.get(normalized, "submitted")
+
+
+def clean_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def standardize_date(value):
+    if value is None or str(value).strip() == "":
+        return None
+    value_str = str(value).strip()
+    try:
+        return pd.to_datetime(value_str, errors="raise").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def safe_date_value(value):
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str):
+        value = standardize_date(value)
+        if value is None:
+            return None
+        value = pd.to_datetime(value)
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
+
+
+def load_data():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story FROM submissions ORDER BY date_of_submission DESC, id DESC",
+        conn,
+    )
+    conn.close()
+    if df.empty:
+        return pd.DataFrame(columns=["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
+    return df
+
+
+def insert_submission(story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO submissions (story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            clean_text(story_name),
+            clean_text(submitted_to),
+            normalize_status(status),
+            date_of_submission,
+            date_of_response,
+            clean_text(url_for_story) if clean_text(url_for_story) else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_submission(submission_id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        UPDATE submissions
+        SET story_name = ?, submitted_to = ?, status = ?, date_of_submission = ?, date_of_response = ?, url_for_story = ?
+        WHERE id = ?
+        """,
+        (
+            clean_text(story_name),
+            clean_text(submitted_to),
+            normalize_status(status),
+            date_of_submission,
+            date_of_response,
+            clean_text(url_for_story) if clean_text(url_for_story) else None,
+            submission_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_submission(submission_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM submissions WHERE id = ?", (submission_id,))
+    conn.commit()
+    conn.close()
+
+
+def normalize_header(value):
+    return str(value).strip().lower().replace(" ", "").replace("-", "").replace("_", "").replace("(", "").replace(")", "")
+
+
+def parse_uploaded_file(uploaded_file):
+    file_name = uploaded_file.name.lower()
+    if file_name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif file_name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("Please upload an Excel (.xlsx/.xls) or CSV file.")
+
+    df = df.copy()
+    df.columns = [normalize_header(col) for col in df.columns]
+
+    aliases = {
+        "story_name": ["storyname", "storytitle", "title"],
+        "submitted_to": ["submittedto", "submittedtoentityname", "entityname", "entity"],
+        "status": ["status"],
+        "date_of_submission": ["dateofsubmission", "submissiondate", "submitteddate"],
+        "date_of_response": ["dateofresponse", "responsedate"],
+        "url_for_story": ["urlforthestory", "storyurl", "publishedurl", "url"],
+    }
+
+    for target, possible_names in aliases.items():
+        matched = next((name for name in possible_names if name in df.columns), None)
+        if matched:
+            df.rename(columns={matched: target}, inplace=True)
+
+    required = ["story_name", "submitted_to", "status"]
+    missing = [field for field in required if field not in df.columns]
+    if missing:
+        raise ValueError("The uploaded file is missing required columns: Story Name, Submitted to, Status.")
+
+    cleaned_rows = []
+    for _, row in df.iterrows():
+        story_name = clean_text(row.get("story_name", ""))
+        submitted_to = clean_text(row.get("submitted_to", ""))
+        if not story_name or not submitted_to:
+            continue
+
+        url_for_story_value = clean_text(row.get("url_for_story", ""))
+
+        cleaned_rows.append(
+            {
+                "story_name": story_name,
+                "submitted_to": submitted_to,
+                "status": normalize_status(row.get("status", "submitted")),
+                "date_of_submission": standardize_date(row.get("date_of_submission")),
+                "date_of_response": standardize_date(row.get("date_of_response")),
+                "url_for_story": url_for_story_value or None,
+            }
+        )
+
+    if not cleaned_rows:
+        raise ValueError("No valid rows were found in the uploaded file.")
+
+    return pd.DataFrame(cleaned_rows)
+
+
+def get_status_colors():
+    return {
+        "submitted": "#f7d7a5",
+        "accepted": "#b9f2c7",
+        "rejected": "#f7b7b7",
+        "withdrawn": "#bfd7ff",
+    }
+
+
+def get_existing_story_names():
+    data = load_data()
+    if data.empty:
+        return []
+    return sorted({str(value).strip() for value in data["story_name"].dropna() if str(value).strip()})
+
+
+def get_existing_entities():
+    data = load_data()
+    if data.empty:
+        return []
+    return sorted({str(value).strip() for value in data["submitted_to"].dropna() if str(value).strip()})
+
+
+st.set_page_config(page_title="Story Submission Tracker", layout="wide")
+
+CSS = """
+<style>
+    .main { padding-top: 1rem; }
+    .block-container { padding-top: 1rem; }
+    .metric-card {
+        background: #f3f4f6;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 0.75rem;
+        min-height: 128px;
+        border: 1px solid rgba(148,163,184,0.35);
+        color: #111827;
+    }
+    .status-pill {
+        display: inline-block;
+        padding: 0.32rem 0.7rem;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        font-weight: 700;
+        color: #111827;
+    }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+init_db()
+
+st.title("Story Submission Tracker")
+st.caption("Track submissions across journals, magazines, and publishers from a mobile-friendly dashboard.")
+
+with st.sidebar:
+    st.header("Filters")
+    search_term = st.text_input("Search by story name")
+    status_filter = st.selectbox("Status filter", ["all", *STATUS_ORDER])
+
+    st.markdown("---")
+    st.header("Template")
+    template_path = BASE_DIR / "upload_template.csv"
+    if template_path.exists():
+        template_bytes = template_path.read_bytes()
+        st.download_button(
+            label="Download upload template",
+            data=template_bytes,
+            file_name="upload_template.csv",
+            mime="text/csv",
+        )
+
+    st.markdown("---")
+    st.header("Import data")
+    uploaded_file = st.file_uploader("Upload Excel / CSV", type=["xlsx", "xls", "csv"])
+    if uploaded_file is not None:
+        try:
+            imported_df = parse_uploaded_file(uploaded_file)
+            replace_existing = st.checkbox("Replace existing records", value=False)
+            if st.button("Import file"):
+                if replace_existing:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("DELETE FROM submissions")
+                    conn.commit()
+                    conn.close()
+
+                for _, row in imported_df.iterrows():
+                    insert_submission(
+                        row["story_name"],
+                        row["submitted_to"],
+                        row["status"],
+                        row["date_of_submission"],
+                        row["date_of_response"],
+                        row["url_for_story"],
+                    )
+                st.success(f"Imported {len(imported_df)} rows.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+
+    st.markdown("---")
+    st.header("Export data")
+    export_df = load_data()
+    if not export_df.empty:
+        export_buffer = io.BytesIO()
+        with pd.ExcelWriter(export_buffer, engine="openpyxl") as writer:
+            export_df[["story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"]].to_excel(writer, index=False, sheet_name="Submissions")
+        st.download_button(
+            label="Download Excel",
+            data=export_buffer.getvalue(),
+            file_name="story_submissions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("No data to export yet.")
+
+
+df = load_data()
+if not df.empty:
+    df["status"] = df["status"].apply(normalize_status)
+    if search_term:
+        df = df[df["story_name"].str.contains(search_term, case=False, na=False)]
+    if status_filter != "all":
+        df = df[df["status"] == status_filter]
+else:
+    df = pd.DataFrame(columns=["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
+
+summary = {item: int((df["status"] == item).sum()) if not df.empty else 0 for item in STATUS_ORDER}
+summary["total"] = int(len(df))
+
+col1, col2, col3, col4 = st.columns(4)
+metrics = [
+    ("Total submissions", summary["total"], col1),
+    ("Submitted", summary["submitted"], col2),
+    ("Accepted", summary["accepted"], col3),
+    ("Rejected", summary["rejected"], col4),
+]
+for label, value, container in metrics:
+    with container:
+        st.markdown(f'<div class="metric-card"><h4>{label}</h4><h2>{value}</h2></div>', unsafe_allow_html=True)
+
+status_chart_df = pd.DataFrame({"status": STATUS_ORDER, "count": [summary.get(status, 0) for status in STATUS_ORDER]})
+status_chart_df = status_chart_df[status_chart_df["count"] > 0].copy()
+status_chart_df["color"] = status_chart_df["status"].map(get_status_colors())
+if not status_chart_df.empty:
+    st.subheader("Status overview")
+    chart = alt.Chart(status_chart_df).mark_bar().encode(
+        x=alt.X("status:N", sort=STATUS_ORDER, title="Status"),
+        y=alt.Y("count:Q", title="Count"),
+        color=alt.Color(
+            "status:N",
+            scale=alt.Scale(domain=STATUS_ORDER, range=[get_status_colors()[status] for status in STATUS_ORDER]),
+            legend=None,
+        ),
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+entity_counts = df.groupby("submitted_to").size().reset_index(name="count") if not df.empty else pd.DataFrame(columns=["submitted_to", "count"])
+if not entity_counts.empty:
+    st.subheader("Submissions by entity")
+    entity_chart = alt.Chart(entity_counts).mark_bar(color="#2563eb").encode(
+        x=alt.X("submitted_to:N", sort="-y", title="Entity"),
+        y=alt.Y("count:Q", title="Count"),
+    )
+    st.altair_chart(entity_chart, use_container_width=True)
+
+st.markdown("---")
+
+with st.form("new_submission_form", clear_on_submit=True):
+    st.subheader("Add a submission")
+    existing_story_names = get_existing_story_names()
+    existing_entities = get_existing_entities()
+
+    story_new_option = "Type a new story name..."
+    entity_new_option = "Type a new entity name..."
+    story_options = [story_new_option] + existing_story_names
+    entity_options = [entity_new_option] + existing_entities
+
+    if st.session_state.get("reset_submission_form"):
+        st.session_state.pop("story_name_select", None)
+        st.session_state.pop("entity_name_select", None)
+        st.session_state.pop("new_story_name", None)
+        st.session_state.pop("new_entity_name", None)
+        st.session_state["reset_submission_form"] = False
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        story_selection = st.selectbox("Story Name", options=story_options, index=0, key="story_name_select")
+        if story_selection == story_new_option:
+            story_name = st.text_input("New Story Name", key="new_story_name", placeholder="Enter a new story title")
+        else:
+            story_name = story_selection
+
+        entity_selection = st.selectbox("Submitted to (Entity Name)", options=entity_options, index=0, key="entity_name_select")
+        if entity_selection == entity_new_option:
+            submitted_to = st.text_input("New Entity Name", key="new_entity_name", placeholder="Enter a new entity name")
+        else:
+            submitted_to = entity_selection
+
+        status = st.selectbox("Status", ["submitted", "accepted", "rejected", "withdrawn"])
+    with col_b:
+        date_of_submission = st.date_input("Date of Submission")
+        date_of_response = st.date_input("Date of Response", value=None)
+        url_for_story = st.text_input("URL for the Story (if accepted and published)")
+
+    if st.form_submit_button("Save submission"):
+        if not story_name.strip() or not submitted_to.strip():
+            st.warning("Story name and entity name are required.")
+        else:
+            insert_submission(
+                story_name,
+                submitted_to,
+                status,
+                date_of_submission.isoformat() if date_of_submission else None,
+                date_of_response.isoformat() if date_of_response else None,
+                url_for_story,
+            )
+            st.session_state["reset_submission_form"] = True
+            st.success("Submission saved. The form will refresh to a clean state.")
+            st.rerun()
+
+st.markdown("---")
+
+if df.empty:
+    st.info("No submissions match the current filters yet. Add your first record using the form above.")
+else:
+    st.subheader("Submission list")
+    display_df = df[["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"]].copy()
+    colors = get_status_colors()
+    display_df["status_badge"] = display_df["status"].apply(lambda x: f'<span class="status-pill" style="background:{colors.get(x, "#334155")}">{x.title()}</span>')
+    st.dataframe(
+        display_df[["story_name", "submitted_to", "status_badge", "date_of_submission", "date_of_response", "url_for_story"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Edit or delete a record")
+    selected_id = st.selectbox(
+        "Choose a record",
+        options=df["id"].tolist(),
+        format_func=lambda x: f"{x} - {df.loc[df['id'] == x, 'story_name'].iloc[0]} | {df.loc[df['id'] == x, 'submitted_to'].iloc[0]}",
+    )
+    selected_row = df[df["id"] == selected_id].iloc[0]
+
+    with st.form("edit_submission_form"):
+        story_name_edit = st.text_input("Story Name", value=selected_row["story_name"])
+        submitted_to_edit = st.text_input("Submitted to (Entity Name)", value=selected_row["submitted_to"])
+        status_edit = st.selectbox("Status", ["submitted", "accepted", "rejected", "withdrawn"], index=STATUS_ORDER.index(selected_row["status"]))
+
+        date_of_submission_edit = st.date_input(
+            "Date of Submission",
+            value=safe_date_value(selected_row["date_of_submission"]),
+        )
+        date_of_response_edit = st.date_input(
+            "Date of Response",
+            value=safe_date_value(selected_row["date_of_response"]),
+        )
+        url_for_story_edit = st.text_input("URL for the Story", value=selected_row["url_for_story"] or "")
+
+        col_update, col_delete = st.columns(2)
+        with col_update:
+            update_clicked = st.form_submit_button("Update record")
+        with col_delete:
+            delete_clicked = st.form_submit_button("Delete record")
+
+        if update_clicked:
+            update_submission(
+                selected_id,
+                story_name_edit,
+                submitted_to_edit,
+                status_edit,
+                date_of_submission_edit.isoformat() if date_of_submission_edit else None,
+                date_of_response_edit.isoformat() if date_of_response_edit else None,
+                url_for_story_edit,
+            )
+            st.success("Record updated.")
+            st.rerun()
+
+        if delete_clicked:
+            delete_submission(selected_id)
+            st.success("Record deleted.")
+            st.rerun()
+
+st.markdown("---")
+st.subheader("Workflow board")
+status_colors = get_status_colors()
+board_columns = st.columns(len(STATUS_ORDER))
+for idx, status in enumerate(STATUS_ORDER):
+    with board_columns[idx]:
+        status_rows = df[df["status"] == status].copy() if not df.empty else pd.DataFrame(columns=["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
+        card_color = status_colors.get(status, "#e5e7eb")
+        st.markdown(f'<div style="background:{card_color};padding:0.8rem;border-radius:12px;color:#111827;font-weight:700;text-align:center;margin-bottom:0.8rem;">{status.title()}</div>', unsafe_allow_html=True)
+        if status_rows.empty:
+            st.markdown('<div style="border:1px dashed rgba(15,23,42,0.25); border-radius:10px; padding:0.8rem; color:#374151; text-align:center; background:#f8fafc;">No stories</div>', unsafe_allow_html=True)
+        else:
+            for _, row in status_rows.iterrows():
+                url = row.get("url_for_story") or ""
+                story_url_html = f'<div><a href="{url}" target="_blank" style="color:#111827; font-weight:600;">Open story URL</a></div>' if url else ""
+                date_text = row.get("date_of_submission")
+                response_text = row.get("date_of_response")
+                st.markdown(
+                    f"""
+                    <div style="background:#ffffff; border:1px solid rgba(148,163,184,0.2); border-left:8px solid {card_color}; border-radius:12px; padding:0.9rem; margin-bottom:0.8rem; color:#111827; box-shadow:0 1px 2px rgba(15,23,42,0.08);">
+                        <div style="font-size:1.1rem; font-weight:700; margin-bottom:0.4rem; color:#111827;">{row['story_name']}</div>
+                        <div style="color:#374151; margin-bottom:0.2rem;">{row['submitted_to']}</div>
+                        <div style="font-size:0.8rem; color:#374151; margin-bottom:0.2rem;">Submitted: {date_text if date_text else '—'}</div>
+                        <div style="font-size:0.8rem; color:#374151; margin-bottom:0.3rem;">Response: {response_text if response_text else '—'}</div>
+                        {story_url_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
