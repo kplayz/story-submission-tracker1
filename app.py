@@ -312,8 +312,22 @@ def clean_text(value):
     return str(value).strip()
 
 
+def json_safe_value(value):
+    """Convert pandas missing values into values accepted by JSON APIs."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return value.isoformat()
+    return value
+
+
 def standardize_date(value):
-    if value is None or str(value).strip() == "":
+    if value is None or pd.isna(value) or str(value).strip() == "":
         return None
     value_str = str(value).strip()
     try:
@@ -373,6 +387,7 @@ def insert_submission(story_name, submitted_to, status, date_of_submission, date
         "date_of_response": date_of_response,
         "url_for_story": clean_text(url_for_story) if clean_text(url_for_story) else None,
     }
+    values = {key: json_safe_value(value) for key, value in values.items()}
     if SUPABASE_CLIENT:
         SUPABASE_CLIENT.table("submissions").insert(values).execute()
         return
@@ -407,6 +422,7 @@ def update_submission(submission_id, story_name, submitted_to, status, date_of_s
         "date_of_response": date_of_response,
         "url_for_story": clean_text(url_for_story) if clean_text(url_for_story) else None,
     }
+    values = {key: json_safe_value(value) for key, value in values.items()}
     if SUPABASE_CLIENT:
         SUPABASE_CLIENT.table("submissions").update(values).eq("id", submission_id).eq("user_email", (user_email or "").lower()).execute()
         return
