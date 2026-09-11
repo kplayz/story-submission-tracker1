@@ -11,6 +11,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "story_submissions.db"
 STATUS_ORDER = ["submitted", "accepted", "rejected", "withdrawn"]
@@ -32,6 +37,9 @@ def get_secret_value(key, default=""):
 GOOGLE_CLIENT_ID = get_secret_value("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = get_secret_value("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = get_secret_value("GOOGLE_REDIRECT_URI", "http://localhost:8501")
+SUPABASE_URL = get_secret_value("SUPABASE_URL", "")
+SUPABASE_KEY = get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or get_secret_value("SUPABASE_KEY", "")
+SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_KEY) if create_client and SUPABASE_URL and SUPABASE_KEY else None
 
 
 def hash_password(password):
@@ -39,6 +47,12 @@ def hash_password(password):
 
 
 def get_user_by_email(email):
+    if SUPABASE_CLIENT:
+        response = SUPABASE_CLIENT.table("users").select("id,name,email,password_hash").eq("email", (email or "").strip().lower()).limit(1).execute()
+        if not response.data:
+            return None
+        return response.data[0]
+
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
         "SELECT id, name, email, password_hash FROM users WHERE LOWER(email) = LOWER(?)",
@@ -59,6 +73,12 @@ def create_user(name, email, password):
         return False, "Please enter a valid email address."
     if get_user_by_email(clean_email):
         return False, "An account with this email already exists."
+
+    if SUPABASE_CLIENT:
+        SUPABASE_CLIENT.table("users").insert(
+            {"name": clean_name, "email": clean_email, "password_hash": hash_password(password)}
+        ).execute()
+        return True, "User created successfully."
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -87,6 +107,12 @@ def create_or_get_google_user(email, name):
     existing = get_user_by_email(clean_email)
     if existing:
         return existing
+
+    if SUPABASE_CLIENT:
+        SUPABASE_CLIENT.table("users").insert(
+            {"name": clean_name, "email": clean_email, "password_hash": hash_password(secrets.token_urlsafe(16))}
+        ).execute()
+        return get_user_by_email(clean_email)
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -225,6 +251,9 @@ def render_auth_page():
 
 
 def init_db():
+    if SUPABASE_CLIENT:
+        return
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -308,6 +337,18 @@ def safe_date_value(value):
 
 
 def load_data(user_email=None):
+    if SUPABASE_CLIENT:
+        query = SUPABASE_CLIENT.table("submissions").select(
+            "id,user_email,story_name,submitted_to,status,date_of_submission,date_of_response,url_for_story"
+        )
+        if user_email is not None:
+            query = query.eq("user_email", (user_email or "").lower())
+        response = query.order("date_of_submission", desc=True).order("id", desc=True).execute()
+        df = pd.DataFrame(response.data)
+        if df.empty:
+            return pd.DataFrame(columns=["id", "user_email", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"])
+        return df
+
     conn = sqlite3.connect(DB_PATH)
     query = "SELECT id, user_email, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story FROM submissions"
     params = []
@@ -323,6 +364,19 @@ def load_data(user_email=None):
 
 
 def insert_submission(story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story, user_email=""):
+    values = {
+        "user_email": (user_email or "").lower(),
+        "story_name": clean_text(story_name),
+        "submitted_to": clean_text(submitted_to),
+        "status": normalize_status(status),
+        "date_of_submission": date_of_submission,
+        "date_of_response": date_of_response,
+        "url_for_story": clean_text(url_for_story) if clean_text(url_for_story) else None,
+    }
+    if SUPABASE_CLIENT:
+        SUPABASE_CLIENT.table("submissions").insert(values).execute()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -344,6 +398,19 @@ def insert_submission(story_name, submitted_to, status, date_of_submission, date
 
 
 def update_submission(submission_id, story_name, submitted_to, status, date_of_submission, date_of_response, url_for_story, user_email=""):
+    values = {
+        "user_email": (user_email or "").lower(),
+        "story_name": clean_text(story_name),
+        "submitted_to": clean_text(submitted_to),
+        "status": normalize_status(status),
+        "date_of_submission": date_of_submission,
+        "date_of_response": date_of_response,
+        "url_for_story": clean_text(url_for_story) if clean_text(url_for_story) else None,
+    }
+    if SUPABASE_CLIENT:
+        SUPABASE_CLIENT.table("submissions").update(values).eq("id", submission_id).eq("user_email", (user_email or "").lower()).execute()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -366,7 +433,11 @@ def update_submission(submission_id, story_name, submitted_to, status, date_of_s
     conn.close()
 
 
-def delete_submission(submission_id):
+def delete_submission(submission_id, user_email=""):
+    if SUPABASE_CLIENT:
+        SUPABASE_CLIENT.table("submissions").delete().eq("id", submission_id).eq("user_email", (user_email or "").lower()).execute()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM submissions WHERE id = ?", (submission_id,))
     conn.commit()
@@ -540,10 +611,13 @@ with st.sidebar:
             replace_existing = st.checkbox("Replace existing records", value=False)
             if st.button("Import file"):
                 if replace_existing:
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.execute("DELETE FROM submissions WHERE user_email = ?", ((user_email or "").lower(),))
-                    conn.commit()
-                    conn.close()
+                    if SUPABASE_CLIENT:
+                        SUPABASE_CLIENT.table("submissions").delete().eq("user_email", (user_email or "").lower()).execute()
+                    else:
+                        conn = sqlite3.connect(DB_PATH)
+                        conn.execute("DELETE FROM submissions WHERE user_email = ?", ((user_email or "").lower(),))
+                        conn.commit()
+                        conn.close()
 
                 for _, row in imported_df.iterrows():
                     insert_submission(
@@ -741,7 +815,7 @@ else:
             st.rerun()
 
         if delete_clicked:
-            delete_submission(selected_id)
+            delete_submission(selected_id, user_email=user_email)
             st.success("Record deleted.")
             st.rerun()
 
