@@ -779,10 +779,9 @@ if df.empty:
 else:
     st.subheader("Submission list")
     display_df = df[["id", "story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"]].copy()
-    colors = get_status_colors()
-    display_df["status_badge"] = display_df["status"].apply(lambda x: f'<span class="status-pill" style="background:{colors.get(x, "#334155")}">{x.title()}</span>')
+    display_df = display_df.sort_values("story_name", key=lambda values: values.str.lower())
     st.dataframe(
-        display_df[["story_name", "submitted_to", "status_badge", "date_of_submission", "date_of_response", "url_for_story"]],
+        display_df[["story_name", "submitted_to", "status", "date_of_submission", "date_of_response", "url_for_story"]],
         use_container_width=True,
         hide_index=True,
     )
