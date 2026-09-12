@@ -1,5 +1,4 @@
 import hashlib
-import html
 import io
 import os
 import secrets
@@ -199,21 +198,7 @@ def render_auth_page():
 
     auth_url = get_google_auth_url()
     if auth_url:
-        st.markdown(
-            f'''
-            <a href="{html.escape(auth_url, quote=True)}" target="_self" style="
-                display:flex; align-items:center; justify-content:center; gap:0.65rem;
-                width:100%; box-sizing:border-box; padding:0.55rem 1rem;
-                border:1px solid #dadce0; border-radius:0.35rem; background:#ffffff;
-                color:#3c4043; font-weight:600; text-decoration:none;
-                font-family:Arial, sans-serif;">
-                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
-                     alt="Google" style="width:1.15rem; height:1.15rem;">
-                Continue with Google
-            </a>
-            ''',
-            unsafe_allow_html=True,
-        )
+        st.link_button("Continue with Google", auth_url, use_container_width=True)
     else:
         st.warning(
             "Google OAuth is not configured. Add GOOGLE_CLIENT_ID and "
