@@ -44,9 +44,9 @@ A mobile-friendly application for tracking story submissions for a writer. It su
    ```
 
 5. In Google Cloud Console, add this redirect URI exactly:
-   `https://<your-app-name>.streamlit.app`
+   `https://<your-app-name>.streamlit.app/`
 
-   Do not add a trailing `/`. The app normalizes the configured redirect URI to this format.
+   The trailing `/` must match the value in Streamlit Cloud Secrets exactly.
 
 6. Deploy the app and sign in with Google or a local account
 

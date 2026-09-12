@@ -37,7 +37,7 @@ def get_secret_value(key, default=""):
 
 GOOGLE_CLIENT_ID = get_secret_value("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = get_secret_value("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI = get_secret_value("GOOGLE_REDIRECT_URI", "http://localhost:8501").rstrip("/")
+GOOGLE_REDIRECT_URI = get_secret_value("GOOGLE_REDIRECT_URI", "http://localhost:8501")
 SUPABASE_URL = get_secret_value("SUPABASE_URL", "")
 SUPABASE_KEY = get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or get_secret_value("SUPABASE_KEY", "")
 SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_KEY) if create_client and SUPABASE_URL and SUPABASE_KEY else None
